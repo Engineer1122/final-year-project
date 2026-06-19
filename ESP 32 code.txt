@@ -1,0 +1,560 @@
+// =============================================================================
+//  ESP32 Firmware — DC Motor Digital Twin (MQTT Version)
+//  Broker  : broker.hivemq.com (public, no auth, port 1883)
+//  Topic   : motordignostic
+//  Motor   : 12V DC, 3500 RPM nominal
+//
+//  Required Libraries (Arduino Library Manager):
+//    - WiFiManager         by tzapu
+//    - PubSubClient        by Nick O'Leary
+//    - ArduinoJson         by Benoit Blanchon
+//    - OneWire             by Jim Studt
+//    - DallasTemperature   by Miles Burton
+//    - U8g2                by oliver
+//    - Wire                (built-in ESP32)
+//
+//  BEFORE UPLOADING:
+//    - On first boot, connect to "ESP32_SETUP" AP to configure WiFi
+//    - Broker and topic are hardcoded — no changes needed
+// =============================================================================
+
+// ===================== INCLUDES =====================
+#include <WiFi.h>
+#include <WiFiManager.h>          // tzapu — captive portal WiFi config
+#include <PubSubClient.h>         // Nick O'Leary — MQTT client
+#include <ArduinoJson.h>          // Benoit Blanchon — JSON serialisation
+#include <Wire.h>                 // I2C (built-in)
+#include <U8g2lib.h>              // OLED SH1106 driver
+#include <OneWire.h>              // 1-Wire protocol
+#include <DallasTemperature.h>    // DS18B20 temperature sensor
+
+// ===================== MQTT CONFIG =====================
+#define MQTT_BROKER     "broker.hivemq.com"
+#define MQTT_PORT       1883
+#define MQTT_TOPIC      "motordignostic"
+#define MQTT_CLIENT_ID  "ESP32_MotorTwin"   // Must be unique on broker
+#define MQTT_RETRY_MS   5000                // Retry interval if disconnected
+
+// ===================== PIN DEFINITIONS =====================
+#define PIN_TEMP        4     // DS18B20 1-Wire
+#define PIN_CURRENT     34    // ACS712-20A analog
+#define PIN_VIBRATION   27    // SW-420 digital (HIGH = vibration)
+#define PIN_RPM         14    // Hall/IR RPM sensor (1 pulse/rev)
+#define PIN_RELAY       26    // Relay, active LOW
+#define PIN_BUTTON      33    // Push button, INPUT_PULLUP
+
+// Temperature RGB LED
+#define LED_TEMP_RED    15
+#define LED_TEMP_GREEN  2
+#define LED_TEMP_BLUE   13
+
+// Current LEDs
+#define LED_CUR_GREEN   25
+#define LED_CUR_RED     12
+
+// Vibration LEDs
+#define LED_VIB_GREEN   5
+#define LED_VIB_RED     32
+
+// ===================== SENSOR CONSTANTS =====================
+#define ACS712_SENSITIVITY  0.100f    // 100 mV/A for ACS712-20A
+#define ADC_VREF            3.3f
+#define ADC_RESOLUTION      4095.0f
+#define CURRENT_FILTER_SIZE 10        // Moving average window
+
+// ===================== THRESHOLDS =====================
+#define TEMP_WARN_C         40.0f
+#define TEMP_CRIT_C         70.0f
+#define TEMP_RATE_FAULT     2.0f      // °C/min
+#define CURRENT_WARN_A      1.50f     // LED warning
+#define CURRENT_FAULT_A     15.0f     // Overcurrent fault
+#define RPM_NOMINAL         3500.0f
+#define RPM_WARN_THRESH     2975.0f   // 15% drop
+#define RPM_RATE_FAULT      -200.0f   // RPM/min drop fault
+#define VIB_PERSIST_FAULT   3         // Consecutive reads → fault
+#define VIB_WARN_COUNT      2
+
+// ===================== TIMING =====================
+#define SAMPLE_INTERVAL     500       // ms
+#define BUTTON_DEBOUNCE     300       // ms
+#define RPM_DEBOUNCE_US     200       // microseconds
+
+// ===================== CIRCULAR BUFFER =====================
+#define BUFFER_SIZE         200
+
+// =============================================================================
+// DATA STRUCTURES
+// =============================================================================
+struct FaultFlags {
+  bool overheat;
+  bool overcurrent;
+  bool vibration_persist;
+  bool rpm_drop;
+};
+
+struct SensorData {
+  unsigned long timestamp;
+  float  temperature;
+  float  current;
+  float  rpm;
+  bool   vibration;
+  float  temp_rate;
+  float  rpm_rate;
+  FaultFlags faults;
+  String health;
+};
+
+struct CircularBuffer {
+  SensorData data[BUFFER_SIZE];
+  int  head;
+  int  tail;
+  int  count;
+  bool full;
+};
+
+// =============================================================================
+// GLOBAL OBJECTS
+// =============================================================================
+OneWire             oneWire(PIN_TEMP);
+DallasTemperature   tempSensor(&oneWire);
+WiFiClient          wifiClient;
+PubSubClient        mqttClient(wifiClient);
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// =============================================================================
+// GLOBAL VARIABLES
+// =============================================================================
+
+// --- Current moving average ---
+float   currentBuffer[CURRENT_FILTER_SIZE] = {0};
+int     currentBufIdx    = 0;
+float   currentZeroOffset = 0.0f;
+
+// --- RPM interrupt ---
+volatile unsigned long pulseCount    = 0;
+volatile unsigned long lastPulseTime = 0;
+
+// --- Trend history ---
+float   tempHistory[5] = {0};
+float   rpmHistory[5]  = {0};
+int     historyIdx     = 0;
+
+// --- Vibration persistence ---
+int     vibConsecutive = 0;
+
+// --- Circular buffer ---
+CircularBuffer dataBuffer = {.head=0, .tail=0, .count=0, .full=false};
+
+// --- Current reading ---
+SensorData currentReading;
+
+// --- Timers ---
+unsigned long lastSampleTime  = 0;
+unsigned long lastButtonTime  = 0;
+unsigned long lastMqttRetry   = 0;
+
+// --- Relay ---
+bool relayState = false;
+
+// =============================================================================
+// ISR — RPM Pulse Counter
+// =============================================================================
+void IRAM_ATTR rpmISR() {
+  unsigned long now = micros();
+  if ((now - lastPulseTime) > RPM_DEBOUNCE_US) {
+    pulseCount++;
+    lastPulseTime = now;
+  }
+}
+
+// =============================================================================
+// FUNCTION: calibrateCurrentSensor()
+// =============================================================================
+void calibrateCurrentSensor() {
+  Serial.println("[CAL] Calibrating ACS712 — motor must be OFF...");
+  long sum = 0;
+  for (int i = 0; i < 100; i++) {
+    sum += analogRead(PIN_CURRENT);
+    delay(5);
+  }
+  currentZeroOffset = (float)(sum / 100);
+  Serial.printf("[CAL] Zero offset ADC = %.2f\n", currentZeroOffset);
+}
+
+// =============================================================================
+// FUNCTION: setRelay()
+// =============================================================================
+void setRelay(bool state) {
+  relayState = state;
+  digitalWrite(PIN_RELAY, relayState ? LOW : HIGH);
+  Serial.printf("[RELAY] %s\n", relayState ? "ON" : "OFF");
+}
+
+// =============================================================================
+// FUNCTION: handleButton() — non-blocking debounced relay toggle
+// =============================================================================
+void handleButton() {
+  unsigned long now = millis();
+  if (digitalRead(PIN_BUTTON) == LOW && (now - lastButtonTime) >= BUTTON_DEBOUNCE) {
+    lastButtonTime = now;
+    setRelay(!relayState);
+  }
+}
+
+// =============================================================================
+// FUNCTION: readSensors()
+// =============================================================================
+void readSensors() {
+  // --- Temperature ---
+  tempSensor.requestTemperatures();
+  float rawTemp = tempSensor.getTempCByIndex(0);
+  if (rawTemp == DEVICE_DISCONNECTED_C) {
+    Serial.println("[WARN] DS18B20 disconnected.");
+    rawTemp = currentReading.temperature;
+  }
+  currentReading.temperature = rawTemp;
+
+  // --- Current (moving average) ---
+  int   rawADC    = analogRead(PIN_CURRENT);
+  float voltage   = ((float)rawADC - currentZeroOffset) * (ADC_VREF / ADC_RESOLUTION);
+  float rawCurrent = voltage / ACS712_SENSITIVITY;
+  currentBuffer[currentBufIdx] = rawCurrent;
+  currentBufIdx = (currentBufIdx + 1) % CURRENT_FILTER_SIZE;
+  float sum = 0;
+  for (int i = 0; i < CURRENT_FILTER_SIZE; i++) sum += currentBuffer[i];
+  currentReading.current = sum / CURRENT_FILTER_SIZE;
+  if (currentReading.current < 0) currentReading.current = 0;
+
+  // --- Vibration ---
+  currentReading.vibration = (digitalRead(PIN_VIBRATION) == HIGH);
+  if (currentReading.vibration) vibConsecutive++;
+  else                          vibConsecutive = 0;
+
+  // --- RPM ---
+  detachInterrupt(digitalPinToInterrupt(PIN_RPM));
+  unsigned long count = pulseCount;
+  pulseCount = 0;
+  attachInterrupt(digitalPinToInterrupt(PIN_RPM), rpmISR, RISING);
+  currentReading.rpm = (float)(count * 60000UL) / (float)SAMPLE_INTERVAL;
+
+  currentReading.timestamp = millis();
+
+  Serial.printf("[SENSOR] T:%.2f°C | I:%.3fA | RPM:%.0f | Vib:%d\n",
+    currentReading.temperature, currentReading.current,
+    currentReading.rpm, currentReading.vibration);
+}
+
+// =============================================================================
+// FUNCTION: updateDiagnostics()
+// =============================================================================
+void updateDiagnostics() {
+  tempHistory[historyIdx % 5] = currentReading.temperature;
+  rpmHistory [historyIdx % 5] = currentReading.rpm;
+  historyIdx++;
+
+  int oldest = historyIdx % 5;
+  int newest = (historyIdx - 1 + 5) % 5;
+  float deltaTimeMin = (5.0f * (SAMPLE_INTERVAL / 1000.0f)) / 60.0f;
+
+  currentReading.temp_rate = (tempHistory[newest] - tempHistory[oldest]) / deltaTimeMin;
+  currentReading.rpm_rate  = (rpmHistory[newest]  - rpmHistory[oldest])  / deltaTimeMin;
+
+  // Fault flags
+  currentReading.faults.overheat =
+    (currentReading.temperature >= TEMP_CRIT_C) ||
+    (currentReading.temp_rate   >= TEMP_RATE_FAULT);
+  currentReading.faults.overcurrent =
+    (currentReading.current >= CURRENT_FAULT_A);
+  currentReading.faults.vibration_persist =
+    (vibConsecutive >= VIB_PERSIST_FAULT);
+  currentReading.faults.rpm_drop =
+    (currentReading.rpm_rate <= RPM_RATE_FAULT);
+
+  // Health status
+  bool anyFault = currentReading.faults.overheat        ||
+                  currentReading.faults.overcurrent      ||
+                  currentReading.faults.vibration_persist||
+                  currentReading.faults.rpm_drop;
+  bool warnCond =
+    (currentReading.temperature >= TEMP_WARN_C && currentReading.temperature < TEMP_CRIT_C) ||
+    (currentReading.rpm > 0 && currentReading.rpm < RPM_WARN_THRESH) ||
+    (vibConsecutive == VIB_WARN_COUNT);
+
+  if      (anyFault) currentReading.health = "Critical";
+  else if (warnCond) currentReading.health = "Warning";
+  else               currentReading.health = "OK";
+
+  Serial.printf("[DIAG] Health:%s | TRate:%.2f | RRate:%.1f\n",
+    currentReading.health.c_str(),
+    currentReading.temp_rate, currentReading.rpm_rate);
+}
+
+// =============================================================================
+// FUNCTION: updateLEDs()
+// =============================================================================
+void updateLEDs() {
+  // Temperature RGB
+  if (currentReading.temperature < 25.0f) {
+    digitalWrite(LED_TEMP_BLUE, HIGH); digitalWrite(LED_TEMP_GREEN, LOW); digitalWrite(LED_TEMP_RED, LOW);
+  } else if (currentReading.temperature <= 40.0f) {
+    digitalWrite(LED_TEMP_BLUE, LOW); digitalWrite(LED_TEMP_GREEN, HIGH); digitalWrite(LED_TEMP_RED, LOW);
+  } else {
+    digitalWrite(LED_TEMP_BLUE, LOW); digitalWrite(LED_TEMP_GREEN, LOW); digitalWrite(LED_TEMP_RED, HIGH);
+  }
+  // Current LEDs
+  digitalWrite(LED_CUR_GREEN, currentReading.current <= CURRENT_WARN_A ? HIGH : LOW);
+  digitalWrite(LED_CUR_RED,   currentReading.current >  CURRENT_WARN_A ? HIGH : LOW);
+  // Vibration LEDs
+  digitalWrite(LED_VIB_GREEN, vibConsecutive <= VIB_WARN_COUNT ? HIGH : LOW);
+  digitalWrite(LED_VIB_RED,   vibConsecutive >  VIB_WARN_COUNT ? HIGH : LOW);
+}
+
+// =============================================================================
+// FUNCTION: updateOLED()
+// =============================================================================
+void updateOLED() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_5x7_tr);
+
+  u8g2.setCursor(0, 10);
+  u8g2.print("TEMP: "); u8g2.print(currentReading.temperature, 1); u8g2.print(" C");
+
+  u8g2.setCursor(0, 21);
+  u8g2.print("CUR:  "); u8g2.print(currentReading.current, 2); u8g2.print(" A");
+
+  u8g2.setCursor(0, 32);
+  u8g2.print("RPM:  "); u8g2.print((int)currentReading.rpm);
+
+  u8g2.setCursor(0, 43);
+  u8g2.print("RELAY:"); u8g2.print(relayState ? " ON" : " OFF");
+
+  u8g2.setCursor(0, 54);
+  u8g2.print("VIB:  "); u8g2.print(vibConsecutive > VIB_WARN_COUNT ? "HIGH" : "OK");
+
+  u8g2.setCursor(70, 54);
+  if      (currentReading.health == "Critical") u8g2.print("H:CRIT");
+  else if (currentReading.health == "Warning")  u8g2.print("H:WARN");
+  else                                           u8g2.print("H:OK");
+
+  u8g2.sendBuffer();
+}
+
+// =============================================================================
+// FUNCTION: buildJsonString()
+// =============================================================================
+String buildJsonString(const SensorData& d) {
+  StaticJsonDocument<512> doc;
+  doc["timestamp"]   = d.timestamp;
+  doc["temperature"] = serialized(String(d.temperature, 2));
+  doc["current"]     = serialized(String(d.current, 3));
+  doc["rpm"]         = (int)d.rpm;
+  doc["vibration"]   = d.vibration ? 1 : 0;
+  doc["health"]      = d.health;
+  doc["temp_rate"]   = serialized(String(d.temp_rate, 2));
+  doc["rpm_rate"]    = serialized(String(d.rpm_rate, 1));
+
+  JsonObject faults = doc.createNestedObject("fault_flags");
+  faults["overheat"]          = d.faults.overheat          ? 1 : 0;
+  faults["overcurrent"]       = d.faults.overcurrent       ? 1 : 0;
+  faults["vibration_persist"] = d.faults.vibration_persist ? 1 : 0;
+  faults["rpm_drop"]          = d.faults.rpm_drop          ? 1 : 0;
+
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
+// =============================================================================
+// FUNCTION: pushToBuffer()
+// =============================================================================
+void pushToBuffer(const SensorData& d) {
+  dataBuffer.data[dataBuffer.head] = d;
+  dataBuffer.head = (dataBuffer.head + 1) % BUFFER_SIZE;
+  if (dataBuffer.full) {
+    dataBuffer.tail = (dataBuffer.tail + 1) % BUFFER_SIZE;
+  } else {
+    dataBuffer.count++;
+  }
+  if (dataBuffer.head == dataBuffer.tail) dataBuffer.full = true;
+}
+
+// =============================================================================
+// FUNCTION: retransmitBuffer() — sends buffered data on MQTT reconnect
+// =============================================================================
+void retransmitBuffer() {
+  if (dataBuffer.count == 0) return;
+  Serial.printf("[BUF] Retransmitting %d buffered entries...\n", dataBuffer.count);
+
+  while (dataBuffer.count > 0) {
+    SensorData& entry = dataBuffer.data[dataBuffer.tail];
+    String json = buildJsonString(entry);
+    mqttClient.publish(MQTT_TOPIC, json.c_str());
+    dataBuffer.tail  = (dataBuffer.tail + 1) % BUFFER_SIZE;
+    dataBuffer.count--;
+    dataBuffer.full  = false;
+    delay(20);   // Small yield between publishes
+  }
+
+  dataBuffer.head = 0; dataBuffer.tail = 0;
+  dataBuffer.count = 0; dataBuffer.full = false;
+  Serial.println("[BUF] Retransmission complete.");
+}
+
+// =============================================================================
+// FUNCTION: connectMQTT() — connects/reconnects to broker
+// =============================================================================
+void connectMQTT() {
+  Serial.printf("[MQTT] Connecting to %s:%d ...\n", MQTT_BROKER, MQTT_PORT);
+
+  // Use unique client ID with ESP32 chip ID to avoid collision on public broker
+  String clientId = String(MQTT_CLIENT_ID) + "_" + String((uint32_t)ESP.getEfuseMac(), HEX);
+
+  if (mqttClient.connect(clientId.c_str())) {
+    Serial.println("[MQTT] Connected!");
+    // Retransmit any buffered data immediately
+    retransmitBuffer();
+  } else {
+    Serial.printf("[MQTT] Failed. State=%d. Retry in %dms.\n",
+                  mqttClient.state(), MQTT_RETRY_MS);
+  }
+}
+
+// =============================================================================
+// FUNCTION: sendData() — publish or buffer
+// =============================================================================
+void sendData() {
+  String json = buildJsonString(currentReading);
+
+  if (mqttClient.connected()) {
+    bool ok = mqttClient.publish(MQTT_TOPIC, json.c_str());
+    Serial.printf("[MQTT] Published (%s): %s\n", ok ? "OK" : "FAIL", json.c_str());
+  } else {
+    pushToBuffer(currentReading);
+    Serial.printf("[BUF] Buffered. Count:%d/%d\n", dataBuffer.count, BUFFER_SIZE);
+  }
+}
+
+// =============================================================================
+// SETUP
+// =============================================================================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n==========================================");
+  Serial.println("  ESP32 DC Motor Digital Twin — MQTT     ");
+  Serial.println("==========================================\n");
+
+  // --- Pin Modes ---
+  pinMode(PIN_VIBRATION,  INPUT);
+  pinMode(PIN_RPM,        INPUT);
+  pinMode(PIN_RELAY,      OUTPUT);
+  pinMode(PIN_BUTTON,     INPUT_PULLUP);
+  pinMode(LED_TEMP_RED,   OUTPUT); pinMode(LED_TEMP_GREEN, OUTPUT); pinMode(LED_TEMP_BLUE, OUTPUT);
+  pinMode(LED_CUR_GREEN,  OUTPUT); pinMode(LED_CUR_RED,    OUTPUT);
+  pinMode(LED_VIB_GREEN,  OUTPUT); pinMode(LED_VIB_RED,    OUTPUT);
+
+  // Relay OFF at start
+  digitalWrite(PIN_RELAY, HIGH);
+  relayState = false;
+
+  // --- I2C + OLED ---
+  Wire.begin(21, 22);
+  u8g2.begin();
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_5x7_tr);
+  u8g2.drawStr(0, 20, "Initialising...");
+  u8g2.sendBuffer();
+
+  // --- DS18B20 ---
+  tempSensor.begin();
+  Serial.printf("[INIT] DS18B20 count: %d\n", tempSensor.getDeviceCount());
+
+  // --- ACS712 Calibration ---
+  calibrateCurrentSensor();
+
+  // --- RPM Interrupt ---
+  attachInterrupt(digitalPinToInterrupt(PIN_RPM), rpmISR, RISING);
+  Serial.println("[INIT] RPM interrupt on GPIO " + String(PIN_RPM));
+
+  // --- Init history arrays ---
+  tempSensor.requestTemperatures();
+  float initTemp = tempSensor.getTempCByIndex(0);
+  float safeTemp = (initTemp == DEVICE_DISCONNECTED_C) ? 25.0f : initTemp;
+  for (int i = 0; i < 5; i++) { tempHistory[i] = safeTemp; rpmHistory[i] = 0.0f; }
+  currentReading.temperature = safeTemp;
+  currentReading.health      = "OK";
+  currentReading.faults      = {false, false, false, false};
+
+  // --- WiFiManager ---
+  Serial.println("[WiFi] Starting WiFiManager...");
+  u8g2.clearBuffer();
+  u8g2.drawStr(0, 20, "Connect to:");
+  u8g2.drawStr(0, 35, "ESP32_SETUP AP");
+  u8g2.sendBuffer();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFiManager wm;
+  wm.setConfigPortalTimeout(120);
+  if (!wm.autoConnect("ESP32_SETUP")) {
+    Serial.println("[WiFi] Config timeout — restarting.");
+    u8g2.clearBuffer();
+    u8g2.drawStr(0, 30, "WiFi Failed!");
+    u8g2.drawStr(0, 45, "Restarting...");
+    u8g2.sendBuffer();
+    delay(2000);
+    ESP.restart();
+  }
+  Serial.print("[WiFi] Connected! IP: ");
+  Serial.println(WiFi.localIP());
+
+  // --- MQTT Setup ---
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  mqttClient.setBufferSize(512);   // Ensure buffer is large enough for JSON
+
+  // Show MQTT connecting on OLED
+  u8g2.clearBuffer();
+  u8g2.drawStr(0, 20, "Connecting MQTT");
+  u8g2.drawStr(0, 35, MQTT_BROKER);
+  u8g2.sendBuffer();
+
+  connectMQTT();
+
+  Serial.println("[INIT] Setup complete.\n");
+}
+
+// =============================================================================
+// LOOP
+// =============================================================================
+void loop() {
+  unsigned long now = millis();
+
+  // --- MQTT client loop (keep connection alive, process callbacks) ---
+  if (mqttClient.connected()) {
+    mqttClient.loop();
+  } else {
+    // Non-blocking reconnect every MQTT_RETRY_MS
+    if (now - lastMqttRetry >= MQTT_RETRY_MS) {
+      lastMqttRetry = now;
+      Serial.println("[MQTT] Reconnecting...");
+      connectMQTT();
+    }
+  }
+
+  // --- Button debounce + relay toggle ---
+  handleButton();
+
+  // --- Main 500ms sampling task ---
+  if (now - lastSampleTime >= SAMPLE_INTERVAL) {
+    lastSampleTime = now;
+
+    readSensors();        // 1. Read sensors
+    updateDiagnostics();  // 2. Trend + faults
+    updateLEDs();         // 3. LEDs
+    updateOLED();         // 4. OLED
+    sendData();           // 5. Publish or buffer
+  }
+}
+
+// =============================================================================
+// END OF FIRMWARE
+// =============================================================================
