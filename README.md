@@ -1,1 +1,2 @@
 # final-year-project
+"This Final Year Project designs a digital twin framework for a DC motor to enable real-time fault diagnosis. By fusing multi-sensor data (current, temperature, vibration, and RPM) and calculating deviations from a healthy digital twin model, the system computes a weighted fault index to classify motor condition as Healthy, Warning, or Faulty. This approach supports predictive maintenance, reduces downtime, and prevents catastrophic failures in DC motor-driven systems."
